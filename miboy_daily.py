@@ -8,12 +8,21 @@ import schedule
 from aiohttp import ClientSession
 from miservice import MiAccount, MiNAService, MiIOService, miio_command
 import argparse
+import logging
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
 
 AM_I_HERE_COMMAND = "2-1078"
 TIMEZONE = "Asia/Shanghai"
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 
 if not GITHUB_TOKEN:
+    logging.error("GITHUB_TOKEN is not set. Please set the environment variable.")
     raise Exception("GITHUB_TOKEN is not set")
 
 # change it to yours
@@ -51,35 +60,54 @@ class MiBoyDaily:
         # we do not want to change old way, so we check if miotDID in `env` first
         # to set device id
 
+        initial_speaker_did = self.speaker_did
+        found_speaker_device = False
+        if not initial_speaker_did:
+            raise Exception("Speaker device ID (speaker_did) is not provided.")
+
         for h in hardware_data:
-            if did := self.speaker_did:
-                if h.get("miotDID", "") == str(did):
-                    self.speaker_did = h.get("deviceID")
-                    break
-                else:
-                    continue
-            if h.get("hardware", "") == self.config.hardware:
+            # Scenario 1: initial_speaker_did is a miotDID, try to find its deviceID
+            if h.get("miotDID", "") == str(initial_speaker_did):
                 self.speaker_did = h.get("deviceID")
+                logging.info(f"Found deviceID {self.speaker_did} for miotDID {initial_speaker_did}")
+                found_speaker_device = True
                 break
-        else:
+            # Scenario 2: initial_speaker_did is already a deviceID
+            elif h.get("deviceID", "") == str(initial_speaker_did):
+                # self.speaker_did is already the correct deviceID
+                logging.info(f"Provided speaker_did {initial_speaker_did} is a valid deviceID.")
+                found_speaker_device = True
+                break
+        
+        if not found_speaker_device:
+            # This means the provided initial_speaker_did (whether it was intended as a miotDID or a deviceID)
+            # was not found in the hardware_data list.
             raise Exception(
-                f"we have no hardware: {self.config.hardware} please use `micli mina` to check"
+                f"Could not find or resolve speaker device with provided ID: {initial_speaker_did}. "
+                f"Please check if it's a correct miotDID or deviceID. Use `micli mina` to list devices."
             )
 
     async def get_am_i_here(self):
         # 人在传感器的应用 1 为人在 0 为人不在
-        data = await miio_command(
-            self.miio_service,
-            self.here_did,
-            AM_I_HERE_COMMAND,
-        )
-        return data
+        try:
+            data = await miio_command(
+                self.miio_service,
+                self.here_did,
+                AM_I_HERE_COMMAND,
+            )
+            return data
+        except aiohttp.ClientError as e:
+            logging.error(f"Error calling miio_command in get_am_i_here: {e}")
+            return None # Or return [] depending on how caller handles it. None seems appropriate.
 
     async def close(self):
         await self.mi_session.close()
 
     async def say_good_morning_to_me(self, value):
-        await self.mina_service.text_to_speech(self.speaker_did, value)
+        try:
+            await self.mina_service.text_to_speech(self.speaker_did, value)
+        except aiohttp.ClientError as e:
+            logging.error(f"Error calling text_to_speech in say_good_morning_to_me: {e}")
 
     async def call_github_action_workflow(self, action_id=UP_ACTION_ID):
         """
@@ -98,17 +126,20 @@ class MiBoyDaily:
                 if (
                     response.status == 204
                 ):  # GitHub API returns 204 No Content on success
-                    print("Successfully triggered workflow")
+                    logging.info("Successfully triggered workflow")
                     return True
                 else:
-                    print(f"Failed to trigger workflow: {response.status}")
+                    logging.error(f"Failed to trigger workflow: {response.status}")
                     return False
 
     async def say_hello_to_me_when_i_am_back(self):
-        await self.say_good_morning_to_me("早上好")
-        await self.mina_service.play_by_music_url(
-            self.speaker_did, "http://192.168.6.212:8000/public/z1.mp3"
-        )
+        await self.say_good_morning_to_me("早上好") # This already has error handling
+        try:
+            await self.mina_service.play_by_music_url(
+                self.speaker_did, "http://192.168.6.212:8000/public/z1.mp3"
+            )
+        except aiohttp.ClientError as e:
+            logging.error(f"Error calling play_by_music_url in say_hello_to_me_when_i_am_back: {e}")
 
 
 def parse_args():
@@ -141,31 +172,31 @@ async def morning_task(account, password, here_did, speaker_did):
 
         # if current hour is after 6 AM, stop the task
         if current_hour >= 7:
-            print("After 6 AM, stopping...")
+            logging.info("After 6 AM, stopping...")
             await miboy.close()
             break
 
         if current_hour < 4:
-            print("Before 4 AM, waiting...")
+            logging.info("Before 4 AM, waiting...")
             await asyncio.sleep(60)
             continue
 
         data = await miboy.get_am_i_here()
-        if data and data[0] == 1:
+        if data and data[0] == 1: # USER_PRESENT was defined as 1
             # means I get up already
-            print("I am up")
+            logging.info("I am up")
             await miboy.say_hello_to_me_when_i_am_back()
             await miboy.call_github_action_workflow()
             await asyncio.sleep(2)
             await miboy.call_github_action_workflow(action_id=WORD_ACTION_ID)
             await miboy.close()
             break
-        elif data and data[0] == 0:
+        elif data and data[0] == 0: # USER_NOT_PRESENT was defined as 0
             # means I am sleeping
-            print("I am sleeping")
+            logging.info("I am sleeping")
             await asyncio.sleep(5)
         else:
-            print("other status")
+            logging.info("Other status or error in get_am_i_here.") # if data is None or data[0] is not 0 or 1
             await asyncio.sleep(5)
 
 
@@ -191,5 +222,5 @@ async def main():
 
 
 if __name__ == "__main__":
-    print("starting...")
+    logging.info("starting...")
     asyncio.run(main())
